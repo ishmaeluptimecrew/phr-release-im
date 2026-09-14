@@ -1,0 +1,138 @@
+name: 8.4 Challenge 03 - SBOM
+
+# "Trivy tells you IS there a CVE. SBOM tells you WHAT packages are in here,
+#  even if no CVE yet." — and Federal EO 14028 requires one for all software.
+#
+# Three things are wrong below.
+#
+# 1. Syft prints a table to the log. A table in a log that expires is not a bill
+#    of materials. When the next log4j drops you need to query this, so it has to
+#    be a CycloneDX JSON file, saved as an artifact.
+#
+# 2. The sbom job runs with `if: always()`, so it happily inventories an image
+#    that Trivy just rejected. The chain is Build -> Scan -> SBOM for a reason.
+#
+# 3. It does not wait for the scan at all.
+#
+# Fix all three. The scan job here is already correct — Challenge 02 covered it.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+
+      - name: Build
+        run: docker build -t phr-api:local -f app/Dockerfile app/
+
+      - name: Trivy scan
+        run: |
+          mkdir -p artifacts/security
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --format sarif \
+            --output artifacts/security/trivy.sarif \
+            phr-api:local
+
+  sbom:
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: anchore/sbom-action/download-syft@v0
+
+      - name: Build
+        run: docker build -t phr-api:local -f app/Dockerfile app/
+
+      - name: Generate SBOM
+        run: |
+          mkdir -p artifacts/security
+          syft phr-api:local
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [build-and-scan, sbom]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom
+        continue-on-error: true
+
+      - name: Check the SBOM is real
+        run: |
+          set -euo pipefail
+
+          if [ ! -s sbom/sbom.cdx.json ]; then
+            echo "::error::No sbom.cdx.json artifact. Syft needs an output format and a path (-o cyclonedx-json=artifacts/security/sbom.cdx.json), and the file needs uploading with actions/upload-artifact."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json, sys
+
+          with open("sbom/sbom.cdx.json") as fh:
+              try:
+                  doc = json.load(fh)
+              except json.JSONDecodeError:
+                  print("::error::sbom.cdx.json is not JSON. That is the Syft table output redirected to a file, not a CycloneDX document. Use -o cyclonedx-json=<path>.")
+                  sys.exit(1)
+
+          if doc.get("bomFormat") != "CycloneDX":
+              print("::error::bomFormat is %r, expected 'CycloneDX'." % doc.get("bomFormat"))
+              sys.exit(1)
+
+          components = doc.get("components") or []
+          if len(components) < 10:
+              print("::error::Only %d components. That is not a whole image." % len(components))
+              sys.exit(1)
+
+          print("CycloneDX %s, %d components" % (doc.get("specVersion"), len(components)))
+          PY
+
+      - name: Check the SBOM waits for the scan
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open(".github/workflows/ch03-sbom-gate.yml") as fh:
+              sbom = yaml.safe_load(fh)["jobs"]["sbom"]
+
+          problems = []
+
+          needs = sbom.get("needs") or []
+          if isinstance(needs, str):
+              needs = [needs]
+          if "build-and-scan" not in needs:
+              problems.append(
+                  "the sbom job has no 'needs: build-and-scan', so it inventories the "
+                  "image while Trivy is still deciding whether to reject it"
+              )
+
+          if "if" in sbom:
+              problems.append(
+                  "the sbom job still has 'if: %s'. always() means it runs even after a "
+                  "failed scan — you would be cataloguing an image you have already "
+                  "rejected, and shipping that catalogue as evidence" % sbom["if"]
+              )
+
+          for problem in problems:
+              print("::error::" + problem)
+          sys.exit(1 if problems else 0)
+          PY

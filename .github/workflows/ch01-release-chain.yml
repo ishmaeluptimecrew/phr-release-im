@@ -1,0 +1,140 @@
+name: 8.4 Challenge 01 - Release Chain
+
+# The spine of the Release Gate. Every stage here is a stub — the point of this
+# challenge is the SHAPE of the pipeline, not what the stages do.
+#
+# As shipped, no job declares `needs:`. GitHub therefore runs all seven at once,
+# so the image lands in staging at the same moment Trivy is still deciding
+# whether it is safe to deploy. The deck's rule is not being applied:
+#
+#   "needs: in GitHub Actions makes it sequential.
+#    If Trivy scan fails, Deploy never runs."
+#
+# Wire the chain:
+#
+#   build -> scan -> sbom -> sign -> deploy-staging -> dast -> smoke-test
+#
+# Then re-run with 'break_scan' ticked and watch the belt stop.
+
+on:
+  workflow_dispatch:
+    inputs:
+      break_scan:
+        description: "Make the Trivy stage fail, to prove the chain stops"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Built phr-api:$GITHUB_SHA"
+
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trivy scan
+        run: |
+          if [ "${{ inputs.break_scan }}" = "true" ]; then
+            echo "::error::CRITICAL CVE found in base layer"
+            exit 1
+          fi
+          echo "0 CRITICAL, 0 HIGH"
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Wrote sbom.cdx.json"
+
+  sign:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Signature recorded in Rekor"
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "phr-staging is live"
+
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ZAP baseline found 0 alerts"
+
+  smoke-test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GET /healthz -> 200"
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  #
+  # It reads this workflow file and checks the dependency graph directly, rather
+  # than timing the jobs — seven jobs racing each other can finish in the right
+  # order by luck, and a gate that passes by luck is the thing we are trying to
+  # get rid of.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [build, scan, sbom, sign, deploy-staging, dast, smoke-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the chain is wired
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          CHAIN = ["build", "scan", "sbom", "sign", "deploy-staging", "dast", "smoke-test"]
+
+          with open(".github/workflows/ch01-release-chain.yml") as fh:
+              jobs = yaml.safe_load(fh)["jobs"]
+
+          problems = []
+          for downstream, upstream in zip(CHAIN[1:], CHAIN):
+              needs = jobs.get(downstream, {}).get("needs") or []
+              if isinstance(needs, str):
+                  needs = [needs]
+              if upstream not in needs:
+                  problems.append(
+                      "'%s' does not wait for '%s'. Add:  needs: %s"
+                      % (downstream, upstream, upstream)
+                  )
+
+          if problems:
+              print("::error::The belt is not a belt yet — these jobs run in parallel:")
+              for problem in problems:
+                  print("::error::  " + problem)
+              sys.exit(1)
+
+          print("Chain wired: " + " -> ".join(CHAIN))
+          PY
+
+      - name: Check a red scan stops the belt
+        if: inputs.break_scan
+        env:
+          DEPLOY_RESULT: ${{ needs.deploy-staging.result }}
+          DAST_RESULT: ${{ needs.dast.result }}
+          SMOKE_RESULT: ${{ needs.smoke-test.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+          for stage in DEPLOY DAST SMOKE; do
+            eval "result=\$${stage}_RESULT"
+            if [ "$result" != "skipped" ]; then
+              echo "::error::Trivy failed but $stage still ran (result=$result). Nothing downstream of a red scan should execute."
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+          echo "Scan went red, everything downstream was skipped. That is the gate working."
+
+      - name: What to do next
+        if: ${{ !inputs.break_scan }}
+        run: |
+          echo "Chain is wired. Now re-run this workflow with 'break_scan' ticked"
+          echo "and confirm deploy-staging, dast and smoke-test are all skipped."

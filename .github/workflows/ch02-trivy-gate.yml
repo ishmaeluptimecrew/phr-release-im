@@ -1,0 +1,103 @@
+name: 8.4 Challenge 02 - Trivy Gate
+
+# "By default Trivy exits 0 even if it finds 100 CRITICALs. It just reports."
+#
+# That is what the scan step below does. It prints a beautiful table of CVEs and
+# then hands you a green tick, which is worse than no scan at all — a scan
+# nobody can fail is a scan everybody stops reading.
+#
+# Two images are built on purpose:
+#
+#   app/Dockerfile.vulnerable   python:3.9-alpine3.18, end of life, has CRITICALs
+#   app/Dockerfile              python:3.13-alpine with pip removed, clean
+#
+# Turn the scan into a gate. The vulnerable image must be BLOCKED and the clean
+# image must still SHIP — if you gate so hard that nothing passes, you have not
+# built a gate, you have built an outage.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan-vulnerable:
+    name: Scan the end-of-life image (must be blocked)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+
+      - name: Build
+        run: docker build -t phr-api:vulnerable -f app/Dockerfile.vulnerable app/
+
+      - name: Trivy scan
+        run: |
+          mkdir -p artifacts/security
+          trivy image phr-api:vulnerable
+
+  scan-patched:
+    name: Scan the patched image (must still ship)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aquasecurity/setup-trivy@v0.3.1
+
+      - name: Build
+        run: docker build -t phr-api:patched -f app/Dockerfile app/
+
+      - name: Trivy scan
+        run: |
+          mkdir -p artifacts/security
+          trivy image phr-api:patched
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif
+          path: artifacts/security/trivy.sarif
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [scan-vulnerable, scan-patched]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: trivy-sarif
+          path: sarif
+        continue-on-error: true
+
+      - name: Check the gate behaves
+        env:
+          VULNERABLE: ${{ needs.scan-vulnerable.result }}
+          PATCHED: ${{ needs.scan-patched.result }}
+        run: |
+          set -euo pipefail
+          failed=0
+
+          if [ "$VULNERABLE" != "failure" ]; then
+            echo "::error::scan-vulnerable came back '$VULNERABLE'. That image has CRITICALs in its base layer and the job went green, so Trivy is reporting, not gating. It needs --severity and --exit-code."
+            failed=1
+          fi
+
+          if [ "$PATCHED" != "success" ]; then
+            echo "::error::scan-patched came back '$PATCHED'. The patched image is clean at CRITICAL and HIGH — if this job is red, your --severity is too broad (LOW and MEDIUM will never be zero) or you gated on the wrong thing."
+            failed=1
+          fi
+
+          if [ ! -s sarif/trivy.sarif ]; then
+            echo "::error::No trivy.sarif was produced. The evidence sink needs it: --format sarif --output artifacts/security/trivy.sarif. Without the file there is nothing to hand an auditor and nothing for the GitHub Security tab."
+            failed=1
+          fi
+
+          [ "$failed" -eq 0 ]
+
+          echo "Vulnerable image blocked, patched image shipped, SARIF written."

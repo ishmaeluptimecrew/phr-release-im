@@ -1,0 +1,255 @@
+name: 8.4 Challenge 07 - Smoke Test and Rollback
+
+# The last check before a human is asked to click "Promote to Sandbox", and the
+# document that human reaches for when they wish they had not.
+#
+# Three things are wrong.
+#
+# 1. smoke-test declares `needs: build`. So it runs alongside the deploy, hitting
+#    a URL that is not serving the new version yet — usually the old one, which
+#    passes. A green tick that proves nothing about what you just shipped.
+#
+# 2. The curl swallows its own result. `curl $URL || true` cannot fail, and
+#    without -f curl exits 0 on a 500 anyway. Two independent reasons this step
+#    can never go red.
+#
+# 3. Nothing rolls back, and docs/runbook-rollback.md is three empty headings.
+#    Blue/green gives you the mechanism; the runbook is what lets somebody who
+#    did not write the deploy use it at 3am.
+#
+# SOLVED. Fix the ordering, make the smoke test capable of failing, add the rollback,
+# and finish the runbook.
+
+on:
+  workflow_dispatch:
+    inputs:
+      break_deploy:
+        description: "Deploy a broken build, to prove the smoke test catches it"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t phr-api:local -f app/Dockerfile app/
+
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy GREEN
+        id: deploy
+        run: |
+          docker build -t phr-api:local -f app/Dockerfile app/
+
+          if [ "${{ inputs.break_deploy }}" = "true" ]; then
+            # The bad release: the container starts, the port is open, and every
+            # request 500s. This is what a smoke test is for — "does it boot" is
+            # not the same question as "does it work".
+            docker run -d --name phr-staging -p 8080:8080 \
+              -e PHR_BREAK_HEALTHZ=1 phr-api:local
+          else
+            docker run -d --name phr-staging -p 8080:8080 phr-api:local
+          fi
+
+          sleep 5
+          echo "url=http://localhost:8080" >> "$GITHUB_OUTPUT"
+
+  dast:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ZAP baseline passed (Challenge 06 covers this properly)"
+
+  smoke-test:
+    needs: dast
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bring the app up on this runner
+        run: |
+          docker build -t phr-api:local -f app/Dockerfile app/
+          if [ "${{ inputs.break_deploy }}" = "true" ]; then
+            docker run -d --name phr-staging -p 8080:8080 -e PHR_BREAK_HEALTHZ=1 phr-api:local
+          else
+            docker run -d --name phr-staging -p 8080:8080 phr-api:local
+          fi
+          sleep 5
+
+      - name: Smoke test
+        run: |
+          # --retry-all-errors matters as much as --retry-connrefused: a
+          # container that has bound its port but not finished starting answers
+          # with an empty reply, and plain --retry will not retry that.
+          curl -fsS --retry 10 --retry-all-errors --retry-connrefused --retry-delay 2 \
+            http://localhost:8080/healthz
+
+  rollback:
+    needs: smoke-test
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Roll back to BLUE
+        run: |
+          echo "Smoke test failed. Executing docs/runbook-rollback.md."
+          echo
+          sed -n '/## Step 1/,$p' docs/runbook-rollback.md
+          echo
+          # In the real pipeline this is the runbook's step 1, not an echo:
+          #   aws ecs update-service --cluster phr-staging --service phr-api \
+          #     --force-new-deployment
+          # ECS shifts the ALB listener back to the BLUE target group in ~10s,
+          # which only works because bake_time_in_minutes kept BLUE alive.
+          echo "ALB listener returned to the BLUE target group."
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [build, deploy-staging, dast, smoke-test]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Does the smoke test run after the deploy?
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open(".github/workflows/ch07-smoke-gate.yml") as fh:
+              jobs = yaml.safe_load(fh)["jobs"]
+
+          needs = jobs["smoke-test"].get("needs") or []
+          if isinstance(needs, str):
+              needs = [needs]
+
+          if "dast" not in needs:
+              print("::error::smoke-test needs %r. It has to come after dast, which comes after deploy-staging — otherwise it is testing whatever was already running, not what you just shipped. It is the LAST check before a human is asked to promote." % (needs,))
+              sys.exit(1)
+
+          print("smoke-test waits for dast")
+          PY
+
+      - name: Can the smoke test fail?
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+
+          # Read the smoke-test job's own steps. Grepping the whole file would
+          # match the flags quoted in these error messages, and the check would
+          # cheerfully pass itself.
+          with open(".github/workflows/ch07-smoke-gate.yml") as fh:
+              smoke = yaml.safe_load(fh)["jobs"]["smoke-test"]
+
+          curls = [
+              line
+              for step in smoke["steps"]
+              for line in step.get("run", "").splitlines()
+              if "curl" in line
+          ]
+
+          problems = []
+
+          if not curls:
+              problems.append("the smoke-test job does not curl anything.")
+
+          if any(re.search(r"\|\|\s*true", line) for line in curls):
+              problems.append(
+                  "the smoke test still ends in '|| true', which throws the result "
+                  "away. Nothing that cannot fail is a test."
+              )
+
+          if not any(re.search(r"curl\s+-[a-zA-Z]*f", line) for line in curls):
+              problems.append(
+                  "curl has no -f. Without it curl exits 0 on a 500 — it fetched "
+                  "the page just fine, the page merely happens to be an error. "
+                  "Use: curl -fsS --retry 5 --retry-connrefused"
+              )
+
+          if not any("--retry" in line for line in curls):
+              problems.append(
+                  "no --retry. A container that takes three seconds to bind its "
+                  "port is not a failed release, but without a retry your gate "
+                  "says it is."
+              )
+
+          for problem in problems:
+              print("::error::" + problem)
+          if problems:
+              sys.exit(1)
+
+          print("The smoke test can fail.")
+          PY
+
+      - name: Is there a rollback?
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open(".github/workflows/ch07-smoke-gate.yml") as fh:
+              jobs = yaml.safe_load(fh)["jobs"]
+
+          rollback = jobs.get("rollback")
+          if rollback is None:
+              print("::error::There is no rollback job. Add one that runs `if: failure()` after smoke-test — a gate that detects a bad release and then does nothing about it has only told you the bad news.")
+              sys.exit(1)
+
+          condition = str(rollback.get("if", ""))
+          if "failure()" not in condition:
+              print("::error::The rollback job's `if:` is %r. It has to be failure() — otherwise it either never fires, or it fires on healthy releases too." % condition)
+              sys.exit(1)
+
+          print("rollback job present, fires on failure")
+          PY
+
+      - name: Is the runbook written?
+        run: |
+          set -euo pipefail
+          failed=0
+
+          for phrase in "aws ecs update-service" "/healthz" "git revert"; do
+            if ! grep -qF "$phrase" docs/runbook-rollback.md; then
+              echo "::error::docs/runbook-rollback.md never mentions '$phrase'. The three steps are: flip ECS back, verify BLUE is actually serving, then reconcile Git so the next deploy does not re-apply the bad change."
+              failed=1
+            fi
+          done
+
+          if grep -q "not written yet" docs/runbook-rollback.md; then
+            echo "::error::docs/runbook-rollback.md still has placeholder sections."
+            failed=1
+          fi
+
+          [ "$failed" -eq 0 ]
+          echo "Runbook is written."
+
+      - name: Did the smoke test reach the right verdict?
+        env:
+          BROKEN: ${{ inputs.break_deploy }}
+          SMOKE: ${{ needs.smoke-test.result }}
+        run: |
+          if [ "$BROKEN" = "true" ]; then
+            if [ "$SMOKE" != "failure" ]; then
+              echo "::error::A deliberately broken build was deployed and smoke-test came back '$SMOKE'. It should have caught this."
+              exit 1
+            fi
+            echo "Broken release caught before anyone was asked to promote it."
+          else
+            if [ "$SMOKE" != "success" ]; then
+              echo "::error::A healthy build was deployed and smoke-test came back '$SMOKE'."
+              exit 1
+            fi
+            echo "Healthy release passed. Now re-run with 'break_deploy' ticked."
+          fi

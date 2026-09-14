@@ -1,0 +1,5 @@
+# Pinned to the versions the Challenge 05 grader was verified against.
+# python-hcl2 8.x keeps source quotes on block labels; test_bluegreen.py strips
+# them. If you unpin this and the parse behaviour changes, that is where it breaks.
+pytest==9.1.1
+python-hcl2==8.1.2

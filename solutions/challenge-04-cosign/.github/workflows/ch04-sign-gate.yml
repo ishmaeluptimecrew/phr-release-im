@@ -1,0 +1,184 @@
+name: 8.4 Challenge 04 - Cosign Keyless
+
+# "Scan + SBOM describe the image. But what if someone swaps the image in ECR
+#  after CI? Cosign proves: this image was built by our release.yml on main and
+#  not tampered with."
+#
+# Keyless signing works like AWS OIDC: GitHub mints a short-lived identity token,
+# Fulcio exchanges it for a 20-minute certificate, Cosign signs with that, and
+# the signature lands in the public Rekor log. No secret keys anywhere.
+#
+# SOLVED. Three things were wrong below.
+#
+# 1. The job cannot get an identity token, so Fulcio has nothing to trust.
+#    Look at `permissions:`.
+#
+# 2. It signs `:latest`. Tags are mutable — someone can push a different image
+#    to the same tag tomorrow and your signature still "verifies". Sign the
+#    digest, which is the image.
+#
+# 3. `cosign verify` is missing the two flags that make verification mean
+#    anything. Without them you are asking "is this signed by somebody?" when
+#    the question is "is this signed by OUR release workflow?"
+#
+# Note: this publishes to the public Rekor transparency log. That is normal and
+# it is what makes the signature auditable — but it is public, so do not sign
+# anything you would not publish.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # Fulcio needs this to mint a signing certificate
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}/phr-api
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sigstore/cosign-installer@v3.7.0
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        run: |
+          IMAGE_LOWER=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          echo "IMAGE_LOWER=$IMAGE_LOWER" >> "$GITHUB_ENV"
+
+          docker build -t "$IMAGE_LOWER:latest" -f app/Dockerfile app/
+          docker push "$IMAGE_LOWER:latest"
+
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$IMAGE_LOWER:latest" | cut -d@ -f2)
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Pushed $IMAGE_LOWER@$DIGEST"
+
+      - name: Sign the image
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGE_LOWER@$DIGEST"
+
+  verify-signature:
+    needs: build-and-sign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Verify
+        env:
+          DIGEST: ${{ needs.build-and-sign.outputs.digest }}
+        run: |
+          IMAGE_LOWER=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          cosign verify \
+            --certificate-identity-regexp "^https://github\.com/${{ github.repository }}/\.github/workflows/ch04-sign-gate\.yml@" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$IMAGE_LOWER@$DIGEST"
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: [build-and-sign, verify-signature]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: sigstore/cosign-installer@v3.7.0
+
+      - name: Check the signing job asked for an identity token
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          with open(".github/workflows/ch04-sign-gate.yml") as fh:
+              doc = yaml.safe_load(fh)
+
+          job = doc["jobs"]["build-and-sign"]
+          permissions = job.get("permissions") or doc.get("permissions") or {}
+
+          if permissions.get("id-token") != "write":
+              print("::error::build-and-sign has no 'id-token: write' permission. Without it GitHub never mints an OIDC token, Fulcio has nothing to exchange for a certificate, and keyless signing cannot work. This is the same OIDC trust model as the AWS role in 8.3.")
+              sys.exit(1)
+
+          print("id-token: write is present")
+          PY
+
+      - name: Check the signing and verifying commands
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+
+          # Inspect each job's own steps. Grepping the whole file would match the
+          # flags quoted in these error messages, and the check would pass itself.
+          with open(".github/workflows/ch04-sign-gate.yml") as fh:
+              jobs = yaml.safe_load(fh)["jobs"]
+
+          def script(job):
+              return "\n".join(step.get("run", "") for step in jobs[job]["steps"])
+
+          problems = []
+
+          signing = script("build-and-sign")
+          if re.search(r"cosign sign\b[^\n]*:latest", signing):
+              problems.append(
+                  "cosign is signing ':latest'. A tag is a pointer and pointers "
+                  "move — someone pushes a different image to that tag tomorrow "
+                  "and your signature still appears to verify. Sign the immutable "
+                  "digest."
+              )
+
+          verifying = script("verify-signature")
+          for flag in ("certificate-identity-regexp", "certificate-oidc-issuer"):
+              if "--%s" % flag not in verifying:
+                  problems.append(
+                      "cosign verify has no --%s. A bare 'cosign verify' asks 'did "
+                      "anyone sign this?' — and anyone can sign anything. An "
+                      "attacker signs your digest from their own repo and walks "
+                      "straight through. Pin WHO signed it and WHICH issuer "
+                      "vouched for them." % flag
+                  )
+
+          for problem in problems:
+              print("::error::" + problem)
+          if problems:
+              sys.exit(1)
+
+          print("Signing the digest, verifying against a pinned identity.")
+          PY
+
+      - name: Check the pin actually excludes other repos
+        env:
+          DIGEST: ${{ needs.build-and-sign.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE_LOWER=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+
+          if [ "${{ needs.verify-signature.result }}" != "success" ]; then
+            echo "::error::verify-signature came back '${{ needs.verify-signature.result }}'. Your identity regexp has to match this workflow's own identity: https://github.com/${{ github.repository }}/.github/workflows/ch04-sign-gate.yml@${{ github.ref }}"
+            exit 1
+          fi
+
+          echo "Now proving the pin actually excludes someone else's repo..."
+          if cosign verify \
+               --certificate-identity-regexp '^https://github\.com/definitely-not-you/evil/.*' \
+               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+               "$IMAGE_LOWER@$DIGEST" >/dev/null 2>&1; then
+            echo "::error::A signature from 'definitely-not-you/evil' also verified. Your identity regexp is too loose to exclude anyone."
+            exit 1
+          fi
+
+          echo "Signature verifies for this workflow and only this workflow."

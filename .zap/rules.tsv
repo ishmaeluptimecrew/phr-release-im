@@ -1,0 +1,18 @@
+# ZAP Baseline rule tuning — PHR API
+#
+# Format: ruleId <TAB> action <TAB> comment
+# Actions: IGNORE (never report) / WARN (report, fails the baseline) / FAIL (report as a failure)
+#
+# A rule that is not listed here defaults to WARN, and zap-baseline exits
+# non-zero on any WARN. So this file has exactly one job: say which findings
+# the PHR programme has formally accepted. Everything else stops the release.
+
+10049	IGNORE	Non-Storable Content — a JSON API is not meant to be cached. Accepted.
+90022	IGNORE	Application Error Disclosure — fires on any 500 status. The content leak is what matters, and rule 10023 catches that. Accepted.
+
+# Armed. A stack trace in a response body blocks the release.
+10023	FAIL	Information Disclosure: Debug Error Messages
+
+# Accepted 2026-08-10 pending the CSP rollout — see ADR-0026.
+10038	IGNORE	Content Security Policy (CSP) Header Not Set
+10020	IGNORE	Missing Anti-clickjacking Header

@@ -1,0 +1,17 @@
+# The base image the team was still building on last sprint.
+#
+# python:3.9-alpine3.18 is end-of-life: Alpine 3.18 stopped receiving security
+# updates, and Python 3.9 is out of support. It carries CRITICALs.
+#
+# This is the deck's opening story made real — "the image had a CRITICAL CVE in
+# the alpine:3.18 base layer" — and Challenge 02's scan-vulnerable job builds it
+# on purpose. That job MUST go red. If it is green, your gate is decorative.
+FROM python:3.9-alpine3.18
+
+WORKDIR /app
+COPY main.py .
+
+ENV PORT=8080
+EXPOSE 8080
+
+CMD ["python", "main.py"]

@@ -1,0 +1,131 @@
+name: 8.4 Challenge 06 - ZAP Baseline
+
+# "Neither flaw is in the code or the image. They only exist in the running
+#  config." Semgrep sees source. Trivy sees layers. Only DAST sees what the
+#  deployed app actually puts on the wire.
+#
+# The deploy job below starts the real container, so ZAP has a live URL to hit.
+# Then ZAP spiders it, reads every response passively, and reports.
+#
+# Reports. It does not gate. Two reasons:
+#
+# 1. The `-I` flag on zap-baseline.py means "do not fail on warnings". With it,
+#    the job is green with ten Mediums outstanding. That is the deck's
+#    fail_action point: without it you have a report, not a gate.
+#
+# 2. .zap/rules.tsv marks rules 10038 and 10020 as IGNORE — missing
+#    Content-Security-Policy and missing X-Frame-Options. Those exceptions were
+#    accepted on 2026-08-10 "pending the CSP rollout" and expired on 08-14.
+#    Read ADR-0026, rows 03 and 04.
+#
+# SOLVED. Arm the gate, then do the rollout it was waiting for: app/main.py sends no
+# security headers at all, and /api/error hands out a full Python stack trace.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to "staging"
+        run: |
+          docker build -t phr-api:local -f app/Dockerfile app/
+          docker run -d --name phr-staging -p 8080:8080 phr-api:local
+
+          for _ in $(seq 1 20); do
+            if curl -fsS http://localhost:8080/healthz >/dev/null 2>&1; then
+              echo "staging is up"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::staging never came up"
+          exit 1
+
+      - name: ZAP baseline scan
+        run: |
+          mkdir -p zap-wrk && cp .zap/rules.tsv zap-wrk/ && chmod -R 777 zap-wrk
+
+          docker run --rm --network host \
+            -v "$PWD/zap-wrk:/zap/wrk/:rw" \
+            zaproxy/zap-stable zap-baseline.py \
+              -t http://localhost:8080 \
+              -c rules.tsv \
+              -r zap-report.html \
+              -z "-config spider.maxDepth=2"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: zap-wrk/zap-report.html
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: dast
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Is the gate armed?
+        run: |
+          python3 - <<'PY'
+          import re, sys, yaml
+
+          # Read the dast job's own steps rather than grepping the whole file —
+          # otherwise this check matches the flags quoted in its own error
+          # messages and passes itself.
+          with open(".github/workflows/ch06-zap-gate.yml") as fh:
+              dast = yaml.safe_load(fh)["jobs"]["dast"]
+
+          script = "\n".join(step.get("run", "") for step in dast["steps"])
+
+          problems = []
+
+          if re.search(r"(^|\s)-I(\s|\\|$)", script, re.MULTILINE):
+              problems.append(
+                  "zap-baseline.py is still running with -I, which means 'report "
+                  "the warnings, exit 0 anyway'. The job is green no matter what "
+                  "ZAP finds. Remove it."
+              )
+
+          with open(".zap/rules.tsv") as fh:
+              rules = fh.read().splitlines()
+
+          for line in rules:
+              if line.startswith("#") or "\t" not in line:
+                  continue
+              rule_id, action = line.split("\t")[:2]
+              if rule_id in ("10038", "10020") and action.strip() == "IGNORE":
+                  problems.append(
+                      "rules.tsv still has rule %s set to IGNORE. That exception "
+                      "expired on 2026-08-14 (ADR-0026 rows 03 and 04). Silencing "
+                      "a finding is not fixing it — and this one silences exactly "
+                      "the header the deck is about." % rule_id
+                  )
+
+          for problem in problems:
+              print("::error::" + problem)
+          if problems:
+              sys.exit(1)
+
+          print("Gate is armed.")
+          PY
+
+      - name: Did the running app pass it?
+        run: |
+          if [ "${{ needs.dast.result }}" != "success" ]; then
+            echo "::error::ZAP is red. Open the zap-report artifact: every WARN-NEW line is a header the deployed app is not sending, or a response body saying more than it should. Arming the gate was step one; the app has to actually pass it."
+            exit 1
+          fi
+          echo "0 alerts against the running app, with the gate armed. This is what DAST is for."

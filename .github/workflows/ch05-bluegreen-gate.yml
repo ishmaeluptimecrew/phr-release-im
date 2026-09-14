@@ -1,0 +1,79 @@
+name: 8.4 Challenge 05 - Blue/Green Deploy
+
+# "A release you cannot undo is a liability."
+#
+# terraform/ecs_service.tf describes how the team ships today: a rolling update.
+# It is valid Terraform. `terraform validate` is perfectly happy with it. It also
+# means that the moment a bad version starts, users are on it and the old task
+# set is being torn down — there is nothing left to roll back to.
+#
+# Convert it to native ECS blue/green. Four things are missing:
+#
+#   strategy = "BLUE_GREEN"          ECS runs the cutover itself, no CodeDeploy
+#   bake_time_in_minutes             BLUE stays warm after traffic shifts
+#   a second (green) target group    plus advanced_configuration pointing at it
+#   lifecycle_hook                   your check, run POST_PRODUCTION_TRAFFIC_SHIFT
+#
+# No AWS credentials are used and nothing is ever applied. This reads the
+# configuration only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -diff
+
+      - name: terraform init
+        working-directory: terraform
+        run: terraform init -backend=false -no-color
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+  # ---------------------------------------------------------------------------
+  # Grader. Do not edit this job.
+  #
+  # `terraform validate` proves the configuration parses and the argument names
+  # exist. A rolling update parses perfectly well. These checks are the gap
+  # between "valid Terraform" and "a release you can undo".
+  # ---------------------------------------------------------------------------
+  verify:
+    needs: validate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install the grader's dependencies
+        run: pip install -r tests/requirements.txt
+
+      - name: Is this actually blue/green?
+        run: pytest tests -q
+
+      - name: Did the configuration stay valid?
+        run: |
+          if [ "${{ needs.validate.result }}" != "success" ]; then
+            echo "::error::The validate job is red. Blue/green properties are only worth checking on Terraform that parses — read that job's log first."
+            exit 1
+          fi
+          echo "Valid Terraform, and a deployment you can undo."
